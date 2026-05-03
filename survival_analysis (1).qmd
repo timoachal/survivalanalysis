@@ -1,7 +1,7 @@
 ---
 title: "Survival Analysis in Medical Research"
 subtitle: "Kaplan-Meier Curves, Cox Models & Time-to-Event Analysis"
-author: "Survival Analysis Report"
+author: "Timothy Achala"
 date: today
 format:
   docx:
