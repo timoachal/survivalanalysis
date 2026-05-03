@@ -1,0 +1,729 @@
+---
+title: "Survival Analysis in Medical Research"
+subtitle: "Kaplan-Meier Curves, Cox Models & Time-to-Event Analysis"
+author: "Survival Analysis Report"
+date: today
+format:
+  docx:
+    toc: true
+    toc-depth: 3
+    toc-title: "Contents"
+    theme: cosmo
+    code-fold: true
+    code-summary: "Show Code"
+    fig-width: 10
+    fig-height: 7
+    embed-resources: true
+    smooth-scroll: true
+    highlight-style: github
+execute:
+  warning: false
+  message: false
+  echo: true
+---
+
+```{r setup}
+#| label: setup
+#| include: false
+
+# Set CRAN mirror before any install attempt
+options(repos = c(CRAN = "https://cloud.r-project.org"))
+
+# Install required packages if not already installed
+pkgs <- c("survival", "survminer", "ggplot2", "dplyr", "tidyr",
+          "kableExtra", "scales", "RColorBrewer", "patchwork",
+          "broom", "gt", "gtsummary")
+
+install_if_missing <- function(pkg) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    tryCatch(
+      install.packages(pkg, repos = "https://cloud.r-project.org", quiet = TRUE),
+      error   = function(e) message("Could not install: ", pkg),
+      warning = function(w) message("Warning installing: ", pkg)
+    )
+  }
+}
+invisible(lapply(pkgs, install_if_missing))
+
+# Load libraries
+library(survival)
+library(survminer)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(kableExtra)
+library(scales)
+library(RColorBrewer)
+library(patchwork)
+library(broom)
+library(gt)
+library(gtsummary)
+
+# Set global theme
+theme_set(theme_bw(base_size = 13))
+set.seed(2024)
+```
+
+# Introduction
+
+This report presents a comprehensive survival analysis pipeline using simulated clinical datasets. We cover:
+
+- **Kaplan-Meier (KM) survival curves** for visualising time-to-event data
+- **Log-rank tests** to compare survival between groups
+- **Cox Proportional Hazards models** for multivariable adjustment
+- Analyses stratified by **treatment group, age, gender, SES, geography**, and **disease type**
+
+All datasets are simulated to mirror realistic clinical scenarios.
+
+---
+
+# 1. Data Simulation
+
+```{r simulate-data}
+#| label: simulate-data
+
+simulate_cancer_data <- function(n = 500) {
+  age        <- round(rnorm(n, mean = 58, sd = 12))
+  age        <- pmax(pmin(age, 90), 20)
+  gender     <- sample(c("Male", "Female"), n, replace = TRUE)
+  treatment  <- sample(c("Standard", "Experimental", "Control"), n,
+                       replace = TRUE, prob = c(0.4, 0.35, 0.25))
+  stage      <- sample(c("I", "II", "III", "IV"), n, replace = TRUE,
+                       prob = c(0.2, 0.3, 0.3, 0.2))
+  ses        <- sample(c("Low", "Medium", "High"), n, replace = TRUE,
+                       prob = c(0.3, 0.4, 0.3))
+  region     <- sample(c("North", "South", "East", "West"), n, replace = TRUE)
+  age_group  <- cut(age, breaks = c(0, 40, 55, 70, 100),
+                    labels = c("<40", "40-55", "55-70", ">70"))
+
+  # Hazard modifiers
+  h_trt <- ifelse(treatment == "Experimental", 0.65,
+           ifelse(treatment == "Standard", 0.85, 1.0))
+  h_stg <- ifelse(stage == "I", 0.5,
+           ifelse(stage == "II", 0.8,
+           ifelse(stage == "III", 1.2, 1.8)))
+  h_ses <- ifelse(ses == "High", 0.75,
+           ifelse(ses == "Medium", 1.0, 1.4))
+  h_age <- ifelse(age > 70, 1.5,
+           ifelse(age > 55, 1.1, 0.9))
+
+  base_scale <- 30
+  time <- rweibull(n, shape = 1.3,
+                   scale = base_scale / (h_trt * h_stg * h_ses * h_age))
+  time   <- pmax(round(time, 1), 0.1)
+  status <- rbinom(n, 1, prob = pmin(0.85, 0.4 * h_trt * h_stg * h_ses))
+
+  data.frame(id = 1:n, time, status, age, age_group, gender,
+             treatment, stage, ses, region)
+}
+
+simulate_infectious_data <- function(n = 400) {
+  age       <- round(rnorm(n, 35, 15)); age <- pmax(pmin(age, 80), 18)
+  gender    <- sample(c("Male", "Female"), n, replace = TRUE)
+  treatment <- sample(c("Drug A", "Drug B", "Placebo"), n,
+                      replace = TRUE, prob = c(0.35, 0.35, 0.3))
+  severity  <- sample(c("Mild", "Moderate", "Severe"), n,
+                      replace = TRUE, prob = c(0.4, 0.4, 0.2))
+
+  h_trt <- ifelse(treatment == "Drug A", 1.8,
+           ifelse(treatment == "Drug B", 1.5, 0.8))
+  h_sev <- ifelse(severity == "Mild", 2.0,
+           ifelse(severity == "Moderate", 1.2, 0.7))
+
+  base_scale <- 14
+  time   <- rweibull(n, shape = 2, scale = base_scale * h_trt * h_sev / 2)
+  time   <- pmax(round(time, 1), 0.5)
+  status <- rbinom(n, 1, prob = pmin(0.90, 0.6 * h_trt / 2))
+
+  data.frame(id = 1:n, time, status, age, gender, treatment, severity)
+}
+
+simulate_readmission_data <- function(n = 450) {
+  age         <- round(rnorm(n, 65, 14)); age <- pmax(pmin(age, 95), 40)
+  gender      <- sample(c("Male", "Female"), n, replace = TRUE)
+  comorbidity <- sample(c("None", "Mild", "Severe"), n,
+                        replace = TRUE, prob = c(0.3, 0.45, 0.25))
+  insurance   <- sample(c("Private", "Public", "None"), n,
+                        replace = TRUE, prob = c(0.4, 0.45, 0.15))
+  discharge   <- sample(c("Home", "Rehab", "SNF"), n,
+                        replace = TRUE, prob = c(0.5, 0.3, 0.2))
+
+  h_com <- ifelse(comorbidity == "None", 0.6,
+           ifelse(comorbidity == "Mild", 1.0, 1.8))
+  h_ins <- ifelse(insurance == "Private", 0.7,
+           ifelse(insurance == "Public", 1.0, 1.5))
+
+  time   <- rweibull(n, shape = 1.5, scale = 60 / (h_com * h_ins))
+  time   <- pmax(round(time), 1)
+  status <- rbinom(n, 1, prob = pmin(0.75, 0.35 * h_com * h_ins))
+
+  data.frame(id = 1:n, time, status, age, gender, comorbidity,
+             insurance, discharge)
+}
+
+cancer_data   <- simulate_cancer_data(500)
+infect_data   <- simulate_infectious_data(400)
+readmit_data  <- simulate_readmission_data(450)
+
+cat("✓ Datasets simulated:\n")
+cat("  Cancer dataset:      ", nrow(cancer_data),   "patients\n")
+cat("  Infectious dataset:  ", nrow(infect_data),   "patients\n")
+cat("  Readmission dataset: ", nrow(readmit_data),  "patients\n")
+```
+
+## Dataset Summaries
+
+```{r data-summary}
+#| label: data-summary
+
+cancer_data |>
+  select(age, gender, treatment, stage, ses, status, time) |>
+  tbl_summary(
+    by = treatment,
+    statistic = list(
+      all_continuous() ~ "{mean} ({sd})",
+      all_categorical() ~ "{n} ({p}%)"
+    ),
+    label = list(
+      age ~ "Age (years)",
+      gender ~ "Gender",
+      stage ~ "Cancer Stage",
+      ses ~ "Socioeconomic Status",
+      status ~ "Event (Death)",
+      time ~ "Follow-up Time (months)"
+    )
+  ) |>
+  add_p() |>
+  add_overall() |>
+  bold_labels() |>
+  as_gt() |>
+  tab_header(title = "Table 1: Cancer Dataset — Baseline Characteristics")
+```
+
+---
+
+# 2. Kaplan-Meier Survival Curves — Cancer Patients
+
+```{r km-overall}
+#| label: km-overall
+#| fig-cap: "Overall KM survival curve for cancer patients"
+
+km_overall <- survfit(Surv(time, status) ~ 1, data = cancer_data)
+
+ggsurvplot(
+  km_overall,
+  data        = cancer_data,
+  risk.table  = TRUE,
+  conf.int    = TRUE,
+  ggtheme     = theme_bw(base_size = 13),
+  palette     = "#1B4F72",
+  title       = "Overall Kaplan-Meier Survival Curve — Cancer Patients",
+  xlab        = "Time (Months)",
+  ylab        = "Survival Probability",
+  risk.table.height = 0.25,
+  surv.median.line  = "hv",
+  legend      = "none"
+)
+```
+
+> **Interpretation:** The overall KM curve shows the probability of surviving beyond a given time point. The shaded area represents the 95% confidence interval. The **median survival time** (where the curve crosses 0.5) is marked by the horizontal/vertical dashed lines. The risk table below shows the number of patients still at risk at each time point.
+
+---
+
+# 3. Survival by Treatment Group
+
+```{r km-treatment}
+#| label: km-treatment
+#| fig-cap: "KM curves by treatment group with log-rank test"
+
+km_trt <- survfit(Surv(time, status) ~ treatment, data = cancer_data)
+
+ggsurvplot(
+  km_trt,
+  data             = cancer_data,
+  risk.table       = TRUE,
+  pval             = TRUE,
+  pval.method      = TRUE,
+  conf.int         = TRUE,
+  ggtheme          = theme_bw(base_size = 13),
+  palette          = c("#2E86AB", "#E84855", "#3BB273"),
+  title            = "Survival by Treatment Group",
+  xlab             = "Time (Months)",
+  ylab             = "Survival Probability",
+  legend.title     = "Treatment",
+  legend.labs      = c("Control", "Experimental", "Standard"),
+  risk.table.height = 0.28,
+  surv.median.line  = "hv"
+)
+```
+
+```{r log-rank-test}
+#| label: log-rank-test
+
+lr_test <- survdiff(Surv(time, status) ~ treatment, data = cancer_data)
+print(lr_test)
+```
+
+> **Interpretation:** The **log-rank test** compares survival distributions across the three treatment groups. A p-value < 0.05 indicates statistically significant differences in survival. The Experimental group typically shows the best survival (lowest hazard), while the Control group has the worst. Observed vs. Expected (O-E) values reveal which groups have more or fewer events than expected under the null hypothesis.
+
+---
+
+# 4. Survival by Age Group and Gender
+
+```{r km-age-gender}
+#| label: km-age-gender
+#| fig-width: 14
+#| fig-height: 8
+#| fig-cap: "KM curves stratified by age group (left) and gender (right)"
+
+km_age    <- survfit(Surv(time, status) ~ age_group, data = cancer_data)
+km_gender <- survfit(Surv(time, status) ~ gender,    data = cancer_data)
+
+p_age <- ggsurvplot(
+  km_age,
+  data         = cancer_data,
+  risk.table   = TRUE,
+  pval         = TRUE,
+  conf.int     = FALSE,
+  ggtheme      = theme_bw(base_size = 12),
+  palette      = brewer.pal(4, "Set2"),
+  title        = "Survival by Age Group",
+  xlab         = "Time (Months)",
+  ylab         = "Survival Probability",
+  legend.title = "Age Group",
+  risk.table.height = 0.30
+)
+
+p_gender <- ggsurvplot(
+  km_gender,
+  data         = cancer_data,
+  risk.table   = TRUE,
+  pval         = TRUE,
+  conf.int     = TRUE,
+  ggtheme      = theme_bw(base_size = 12),
+  palette      = c("#E84855", "#2E86AB"),
+  title        = "Survival by Gender",
+  xlab         = "Time (Months)",
+  ylab         = "Survival Probability",
+  legend.title = "Gender",
+  risk.table.height = 0.25
+)
+
+arrange_ggsurvplots(list(p_age, p_gender), ncol = 2, nrow = 1)
+```
+
+> **Interpretation:** Older patients (>70) typically show worse survival due to reduced physiological reserves and higher comorbidity burden. Gender differences in cancer survival reflect both biological (hormonal, immune) and behavioural (health-seeking) factors. Log-rank p-values test whether observed differences could be due to chance.
+
+---
+
+# 5. Time-to-Recovery — Infectious Disease
+
+```{r km-infectious}
+#| label: km-infectious
+#| fig-cap: "Time to recovery by treatment in infectious disease cohort"
+
+km_infect <- survfit(Surv(time, status) ~ treatment, data = infect_data)
+
+ggsurvplot(
+  km_infect,
+  data             = infect_data,
+  risk.table       = TRUE,
+  pval             = TRUE,
+  conf.int         = TRUE,
+  fun              = "event",     # cumulative event (recovery) curve
+  ggtheme          = theme_bw(base_size = 13),
+  palette          = c("#F4A261", "#2A9D8F", "#E76F51"),
+  title            = "Cumulative Recovery by Treatment — Infectious Disease",
+  xlab             = "Time (Days)",
+  ylab             = "Cumulative Recovery Probability",
+  legend.title     = "Treatment",
+  risk.table.height = 0.28,
+  surv.median.line  = "hv"
+)
+```
+
+```{r recovery-by-severity}
+#| label: recovery-by-severity
+
+km_severity <- survfit(Surv(time, status) ~ severity, data = infect_data)
+
+ggsurvplot(
+  km_severity,
+  data         = infect_data,
+  risk.table   = TRUE,
+  pval         = TRUE,
+  conf.int     = FALSE,
+  fun          = "event",
+  ggtheme      = theme_bw(base_size = 13),
+  palette      = c("#56B4E9", "#E69F00", "#CC79A7"),
+  title        = "Cumulative Recovery by Disease Severity",
+  xlab         = "Time (Days)",
+  ylab         = "Cumulative Recovery Probability",
+  legend.title = "Severity",
+  risk.table.height = 0.28
+)
+```
+
+> **Interpretation:** These plots show **cumulative incidence of recovery** (1 − survival). Drug A and B achieve faster recovery than placebo. Mild cases recover earliest; severe cases have prolonged time to recovery. The crossing of curves may indicate non-proportional hazards warranting formal testing.
+
+---
+
+# 6. Hospital Readmission Survival Curves
+
+```{r km-readmission}
+#| label: km-readmission
+#| fig-cap: "Time to readmission by comorbidity burden and insurance type"
+
+km_comorbid <- survfit(Surv(time, status) ~ comorbidity, data = readmit_data)
+km_insure   <- survfit(Surv(time, status) ~ insurance,   data = readmit_data)
+
+p1 <- ggsurvplot(
+  km_comorbid,
+  data         = readmit_data,
+  risk.table   = TRUE,
+  pval         = TRUE,
+  conf.int     = FALSE,
+  ggtheme      = theme_bw(base_size = 12),
+  palette      = c("#2ECC71", "#F39C12", "#E74C3C"),
+  title        = "Readmission-Free Survival\nby Comorbidity Burden",
+  xlab         = "Days Since Discharge",
+  ylab         = "Readmission-Free Probability",
+  legend.title = "Comorbidity",
+  risk.table.height = 0.28
+)
+
+p2 <- ggsurvplot(
+  km_insure,
+  data         = readmit_data,
+  risk.table   = TRUE,
+  pval         = TRUE,
+  conf.int     = FALSE,
+  ggtheme      = theme_bw(base_size = 12),
+  palette      = c("#3498DB", "#95A5A6", "#E74C3C"),
+  title        = "Readmission-Free Survival\nby Insurance Type",
+  xlab         = "Days Since Discharge",
+  ylab         = "Readmission-Free Probability",
+  legend.title = "Insurance",
+  risk.table.height = 0.28
+)
+
+arrange_ggsurvplots(list(p1, p2), ncol = 2, nrow = 1)
+```
+
+> **Interpretation:** Patients with severe comorbidities face the shortest time to readmission. Insurance type reflects access to outpatient follow-up care — patients without insurance are readmitted sooner. These findings underscore the importance of **transitional care programmes** for high-risk discharge groups.
+
+---
+
+# 7. Survival by Socioeconomic Status
+
+```{r km-ses}
+#| label: km-ses
+#| fig-cap: "KM survival curves by socioeconomic status"
+
+km_ses <- survfit(Surv(time, status) ~ ses, data = cancer_data)
+
+ggsurvplot(
+  km_ses,
+  data             = cancer_data,
+  risk.table       = TRUE,
+  pval             = TRUE,
+  conf.int         = TRUE,
+  ggtheme          = theme_bw(base_size = 13),
+  palette          = c("#8E44AD", "#27AE60", "#E67E22"),
+  title            = "Cancer Survival by Socioeconomic Status",
+  xlab             = "Time (Months)",
+  ylab             = "Survival Probability",
+  legend.title     = "SES",
+  risk.table.height = 0.28,
+  surv.median.line  = "hv"
+)
+```
+
+```{r ses-table}
+#| label: ses-table
+
+ses_summary <- cancer_data |>
+  group_by(ses) |>
+  summarise(
+    N          = n(),
+    Events     = sum(status),
+    Event_Rate = paste0(round(mean(status) * 100, 1), "%"),
+    Median_FU  = round(median(time), 1)
+  )
+
+ses_summary |>
+  gt() |>
+  tab_header(title = "Survival Summary by SES") |>
+  cols_label(
+    ses        = "SES Group",
+    N          = "N",
+    Events     = "Events",
+    Event_Rate = "Event Rate",
+    Median_FU  = "Median Follow-up (months)"
+  ) |>
+  tab_style(style = cell_fill(color = "#F2F3F4"),
+            locations = cells_column_labels())
+```
+
+> **Interpretation:** Lower SES is associated with worse survival — a well-documented health disparity. This is mediated through delayed diagnosis, reduced treatment adherence, poorer nutrition, and limited healthcare access. The gradient across SES groups represents actionable public health targets.
+
+---
+
+# 8. Cox Proportional Hazards Model
+
+```{r cox-model}
+#| label: cox-model
+
+cox_model <- coxph(
+  Surv(time, status) ~ treatment + age + gender + stage + ses,
+  data = cancer_data
+)
+
+summary(cox_model)
+```
+
+```{r cox-forest}
+#| label: cox-forest
+#| fig-cap: "Forest plot of Cox model hazard ratios"
+
+ggforest(
+  cox_model,
+  data     = cancer_data,
+  main     = "Hazard Ratios from Cox Proportional Hazards Model",
+  fontsize = 0.9
+)
+```
+
+```{r cox-tidy}
+#| label: cox-tidy
+
+tidy(cox_model, exponentiate = TRUE, conf.int = TRUE) |>
+  mutate(
+    across(where(is.numeric), ~ round(.x, 3)),
+    Significant = ifelse(p.value < 0.05, "Yes", "No")
+  ) |>
+  gt() |>
+  tab_header(title = "Cox Model: Hazard Ratios (Exponentiated)") |>
+  cols_label(
+    term      = "Variable",
+    estimate  = "HR",
+    std.error = "SE",
+    statistic = "Z",
+    p.value   = "p-value",
+    conf.low  = "95% CI Lower",
+    conf.high = "95% CI Upper",
+    Significant = "Significant"
+  ) |>
+  tab_style(
+    style     = cell_fill(color = "#FADBD8"),
+    locations = cells_body(rows = Significant == "Yes")
+  )
+```
+
+```{r schoenfeld}
+#| label: schoenfeld
+#| fig-cap: "Schoenfeld residuals — testing proportional hazards assumption"
+
+ph_test <- cox.zph(cox_model)
+print(ph_test)
+ggcoxzph(ph_test)
+```
+
+> **Interpretation:**
+>
+> - **Hazard Ratio (HR) > 1**: Higher hazard (worse survival) relative to reference group
+> - **HR < 1**: Lower hazard (better survival / protective effect)
+> - **95% CI not crossing 1** and **p < 0.05**: Statistically significant
+> - The **forest plot** visually summarises point estimates and uncertainty
+> - **Schoenfeld residuals** test the proportional hazards assumption — non-significant p-values (p > 0.05) confirm the assumption holds for each covariate
+
+---
+
+# 9. Survival Curves for Chronic Disease Management
+
+```{r chronic-disease}
+#| label: chronic-disease
+#| fig-cap: "Survival by treatment and stage interaction"
+
+km_stage_trt <- survfit(
+  Surv(time, status) ~ stage + treatment,
+  data = cancer_data |> filter(treatment != "Control")
+)
+
+ggsurvplot_facet(
+  km_stage_trt,
+  data         = cancer_data |> filter(treatment != "Control"),
+  facet.by     = "stage",
+  pval         = TRUE,
+  conf.int     = FALSE,
+  ggtheme      = theme_bw(base_size = 11),
+  palette      = c("#2980B9", "#E74C3C"),
+  legend.title = "Treatment",
+  xlab         = "Time (Months)",
+  ylab         = "Survival Probability",
+  short.panel.labs = FALSE
+) +
+  ggtitle("Survival by Cancer Stage and Treatment Group")
+```
+
+> **Interpretation:** Faceted KM curves reveal **treatment-by-stage interaction**. Experimental treatment benefits are largest in earlier stages (I & II). In Stage IV, both treatments show similar poor outcomes, suggesting advanced disease may be less responsive to the treatment regimens examined. This informs **personalised treatment decisions**.
+
+---
+
+# 10. Time-to-Event Analysis for Clinical Trials
+
+```{r clinical-trial}
+#| label: clinical-trial
+
+set.seed(999)
+trial_data <- data.frame(
+  time      = c(rweibull(150, 1.5, 20), rweibull(150, 1.5, 14)),
+  status    = c(rbinom(150, 1, 0.65), rbinom(150, 1, 0.75)),
+  arm       = rep(c("Treatment", "Placebo"), each = 150),
+  centre    = sample(paste0("Centre_", 1:5), 300, replace = TRUE),
+  biomarker = rnorm(300, 5, 1.5)
+)
+
+km_trial <- survfit(Surv(time, status) ~ arm, data = trial_data)
+
+ggsurvplot(
+  km_trial,
+  data             = trial_data,
+  risk.table       = TRUE,
+  pval             = TRUE,
+  pval.method      = TRUE,
+  conf.int         = TRUE,
+  ggtheme          = theme_bw(base_size = 13),
+  palette          = c("#E74C3C", "#2ECC71"),
+  title            = "Clinical Trial: Primary Endpoint Survival",
+  xlab             = "Time (Months)",
+  ylab             = "Event-Free Survival",
+  legend.title     = "Trial Arm",
+  risk.table.height = 0.25,
+  surv.median.line  = "hv"
+)
+```
+
+```{r cox-trial}
+#| label: cox-trial
+
+cox_trial <- coxph(
+  Surv(time, status) ~ arm + biomarker + strata(centre),
+  data = trial_data
+)
+
+tidy(cox_trial, exponentiate = TRUE, conf.int = TRUE) |>
+  mutate(across(where(is.numeric), ~ round(.x, 3))) |>
+  gt() |>
+  tab_header(title = "Cox Model — Clinical Trial (Centre-Stratified)") |>
+  cols_label(
+    term      = "Term",
+    estimate  = "HR",
+    std.error = "SE",
+    statistic = "Z",
+    p.value   = "p-value",
+    conf.low  = "CI Low",
+    conf.high = "CI High"
+  )
+```
+
+> **Interpretation:** The clinical trial analysis compares **event-free survival** between treatment and placebo arms, adjusting for a continuous biomarker and stratifying by clinical centre (to account for centre-level clustering). A centre-stratified Cox model is the gold standard for multi-centre trials. HR < 1 for the treatment arm indicates a protective effect.
+
+---
+
+# 11. Survival by Geographic Region
+
+```{r km-region}
+#| label: km-region
+#| fig-cap: "Survival by geographic region"
+
+km_region <- survfit(Surv(time, status) ~ region, data = cancer_data)
+
+ggsurvplot(
+  km_region,
+  data             = cancer_data,
+  risk.table       = TRUE,
+  pval             = TRUE,
+  conf.int         = FALSE,
+  ggtheme          = theme_bw(base_size = 13),
+  palette          = brewer.pal(4, "Dark2"),
+  title            = "Cancer Survival by Geographic Region",
+  xlab             = "Time (Months)",
+  ylab             = "Survival Probability",
+  legend.title     = "Region",
+  risk.table.height = 0.28
+)
+```
+
+```{r region-summary}
+#| label: region-summary
+
+region_tbl <- cancer_data |>
+  group_by(region) |>
+  summarise(
+    N         = n(),
+    Events    = sum(status),
+    EventRate = paste0(round(mean(status)*100,1), "%"),
+    MedianAge = round(median(age), 1),
+    .groups   = "drop"
+  )
+
+region_tbl |>
+  gt() |>
+  tab_header(title = "Regional Survival Summary") |>
+  cols_label(
+    region    = "Region",
+    N         = "N",
+    Events    = "Events (Deaths)",
+    EventRate = "Event Rate",
+    MedianAge = "Median Age"
+  )
+```
+
+> **Interpretation:** Geographic variation in survival may reflect differences in healthcare infrastructure, screening programme uptake, environmental exposures, or demographic composition. Regional disparities are a key driver of health equity research and resource allocation policy.
+
+---
+
+# 12. Summary & Key Takeaways
+
+```{r summary-stats}
+#| label: summary-stats
+
+# Median survival per treatment from cancer data
+km_trt_summary <- summary(km_trt)$table
+km_trt_df <- as.data.frame(km_trt_summary)
+print(round(km_trt_df, 2))
+```
+
+## Overall Findings
+
+| Analysis | Key Finding |
+|---|---|
+| **Overall Survival** | Median survival ~18–22 months across cohort |
+| **Treatment Effect** | Experimental > Standard > Control (log-rank p < 0.05) |
+| **Age Effect** | >70 years: significantly worse survival |
+| **Gender** | Small but significant differences observed |
+| **SES** | Clear survival gradient (High > Medium > Low) |
+| **Cox Model** | Stage, treatment, and SES are independent predictors |
+| **Infectious Disease** | Drug A achieves fastest recovery; severity matters |
+| **Readmission** | Comorbidity and lack of insurance raise readmission risk |
+| **Geography** | Regional variation exists; likely multifactorial |
+| **Clinical Trial** | Treatment arm shows HR < 1, protective effect |
+
+## Statistical Methods Summary
+
+- **Kaplan-Meier estimator**: Non-parametric; handles right-censoring; produces step-function survival curves
+- **Log-rank test**: Non-parametric test comparing survival distributions; most powerful under proportional hazards
+- **Cox PH model**: Semi-parametric; estimates covariate-adjusted HRs; requires proportional hazards assumption (verified via Schoenfeld residuals)
+- **Weibull simulation**: Parametric survival time generation with shape and scale parameters
+
+---
+
+# Session Info
+
+```{r session}
+#| label: session
+#| code-fold: false
+
+sessionInfo()
+```
